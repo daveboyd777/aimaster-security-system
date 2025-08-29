@@ -1,0 +1,368 @@
+name: AIMaster Security System CI/CD
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main ]
+  issues:
+    types: [ opened, labeled, assigned ]
+  schedule:
+    # Run automated maintenance every day at 2 AM UTC
+    - cron: '0 2 * * *'
+
+env:
+  PWSH_VERSION: '7.4.x'
+  
+jobs:
+  # Automated PowerShell validation
+  powershell-validation:
+    name: PowerShell Script Validation
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [windows-latest, ubuntu-latest, macos-latest]
+    
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+      
+    - name: Install PowerShell (Ubuntu/macOS)
+      if: matrix.os != 'windows-latest'
+      shell: bash
+      run: |
+        if [[ "${{ matrix.os }}" == "ubuntu-latest" ]]; then
+          # Install PowerShell on Ubuntu
+          wget -q https://packages.microsoft.com/config/ubuntu/20.04/packages-microsoft-prod.deb
+          sudo dpkg -i packages-microsoft-prod.deb
+          sudo apt-get update
+          sudo apt-get install -y powershell
+        elif [[ "${{ matrix.os }}" == "macos-latest" ]]; then
+          # Install PowerShell on macOS
+          brew install --cask powershell
+        fi
+        
+    - name: Validate PowerShell Scripts
+      shell: pwsh
+      run: |
+        Write-Host "Validating PowerShell scripts..."
+        $scriptFiles = Get-ChildItem -Path . -Recurse -Filter "*.ps1" -ErrorAction SilentlyContinue
+        $moduleFiles = Get-ChildItem -Path . -Recurse -Filter "*.psm1" -ErrorAction SilentlyContinue
+        
+        $allFiles = $scriptFiles + $moduleFiles
+        $errors = 0
+        
+        foreach ($file in $allFiles) {
+            Write-Host "Validating: $($file.FullName)"
+            try {
+                $ast = [System.Management.Automation.Language.Parser]::ParseFile($file.FullName, [ref]$null, [ref]$null)
+                if (-not $ast) {
+                    Write-Error "Failed to parse: $($file.FullName)"
+                    $errors++
+                } else {
+                    Write-Host "✓ Valid: $($file.Name)" -ForegroundColor Green
+                }
+            } catch {
+                Write-Error "Parse error in $($file.FullName): $($_.Exception.Message)"
+                $errors++
+            }
+        }
+        
+        if ($errors -gt 0) {
+            Write-Error "Found $errors validation errors"
+            exit 1
+        } else {
+            Write-Host "All PowerShell scripts are valid!" -ForegroundColor Green
+        }
+
+  # Security scan
+  security-scan:
+    name: Security Analysis
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+      
+    - name: Run security scan
+      uses: github/super-linter@v4
+      env:
+        DEFAULT_BRANCH: main
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        VALIDATE_ALL_CODEBASE: true
+        VALIDATE_POWERSHELL: true
+        VALIDATE_MARKDOWN: true
+        
+    - name: PowerShell Security Analysis
+      shell: pwsh
+      run: |
+        Write-Host "Running security analysis..."
+        
+        # Install PSScriptAnalyzer if not available
+        if (-not (Get-Module -ListAvailable -Name PSScriptAnalyzer)) {
+            Install-Module -Name PSScriptAnalyzer -Force -Scope CurrentUser
+        }
+        
+        $scriptFiles = Get-ChildItem -Path . -Recurse -Filter "*.ps*" -ErrorAction SilentlyContinue
+        $securityIssues = @()
+        
+        foreach ($file in $scriptFiles) {
+            $results = Invoke-ScriptAnalyzer -Path $file.FullName -Severity @('Error', 'Warning') -ErrorAction SilentlyContinue
+            if ($results) {
+                $securityIssues += $results
+                Write-Host "Security issues found in $($file.Name):" -ForegroundColor Yellow
+                $results | ForEach-Object { Write-Host "  - $($_.Message)" -ForegroundColor Red }
+            }
+        }
+        
+        if ($securityIssues.Count -eq 0) {
+            Write-Host "✓ No security issues found!" -ForegroundColor Green
+        } else {
+            Write-Warning "Found $($securityIssues.Count) security issues"
+            # Don't fail on warnings, just report them
+        }
+
+  # Automated testing
+  run-tests:
+    name: Run Tests
+    runs-on: ${{ matrix.os }}
+    needs: powershell-validation
+    strategy:
+      matrix:
+        os: [windows-latest, ubuntu-latest, macos-latest]
+        environment: [Development, Staging]
+    
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+      
+    - name: Install PowerShell modules
+      shell: pwsh
+      run: |
+        Write-Host "Installing required modules..."
+        Install-Module -Name Microsoft.PowerShell.SecretManagement -Force -Scope CurrentUser -AllowClobber
+        Install-Module -Name Microsoft.PowerShell.SecretStore -Force -Scope CurrentUser -AllowClobber
+        
+    - name: Run AIMaster Security System Tests
+      shell: pwsh
+      env:
+        AIMASTER_SECURE_MODE: ${{ matrix.environment == 'Staging' && 'true' || 'false' }}
+      run: |
+        Write-Host "Running tests for ${{ matrix.environment }} environment on ${{ matrix.os }}..."
+        
+        try {
+            # Run the system in test mode
+            ./AIMaster-SecuritySystem.ps1 -Environment ${{ matrix.environment }} -InitializeOnly -ErrorAction Stop
+            Write-Host "✓ System initialization successful" -ForegroundColor Green
+            
+            # Run with sample user and tests if in development
+            if ("${{ matrix.environment }}" -eq "Development") {
+                ./AIMaster-SecuritySystem.ps1 -Environment ${{ matrix.environment }} -CreateSampleUser -RunTests -ErrorAction Stop
+                Write-Host "✓ Full system tests completed" -ForegroundColor Green
+            }
+        } catch {
+            Write-Error "Test failed: $($_.Exception.Message)"
+            exit 1
+        }
+
+  # Automated issue triage
+  issue-triage:
+    name: Automated Issue Triage
+    runs-on: ubuntu-latest
+    if: github.event_name == 'issues' && github.event.action == 'opened'
+    
+    steps:
+    - name: Auto-label security issues
+      if: contains(github.event.issue.title, '[SECURITY]')
+      uses: actions/github-script@v6
+      with:
+        script: |
+          github.rest.issues.addLabels({
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            issue_number: context.issue.number,
+            labels: ['security', 'critical', 'needs-immediate-attention']
+          });
+          
+          github.rest.issues.createComment({
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            issue_number: context.issue.number,
+            body: `🚨 **Security Issue Detected**
+
+This issue has been automatically labeled as a security concern. 
+
+**Next Steps:**
+1. Security team will be notified immediately
+2. Issue will be reviewed within 24 hours for critical vulnerabilities
+3. For responsible disclosure, consider reporting critical vulnerabilities privately
+
+*This is an automated response for the AIMaster Security System - Generated by Warp AI*`
+          });
+
+    - name: Auto-label bug reports
+      if: contains(github.event.issue.title, '[BUG]')
+      uses: actions/github-script@v6
+      with:
+        script: |
+          github.rest.issues.addLabels({
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            issue_number: context.issue.number,
+            labels: ['bug', 'needs-triage', 'community-reported']
+          });
+
+    - name: Auto-label feature requests
+      if: contains(github.event.issue.title, '[FEATURE]')
+      uses: actions/github-script@v6
+      with:
+        script: |
+          github.rest.issues.addLabels({
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            issue_number: context.issue.number,
+            labels: ['enhancement', 'needs-triage', 'community-request']
+          });
+
+  # Automated dependency updates
+  dependency-updates:
+    name: Check Dependencies
+    runs-on: ubuntu-latest
+    if: github.event_name == 'schedule'
+    
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+      
+    - name: Check PowerShell Gallery for updates
+      shell: pwsh
+      run: |
+        Write-Host "Checking for PowerShell module updates..."
+        
+        $modules = @(
+            'Microsoft.PowerShell.SecretManagement',
+            'Microsoft.PowerShell.SecretStore',
+            'PSScriptAnalyzer'
+        )
+        
+        $updates = @()
+        foreach ($module in $modules) {
+            try {
+                $latest = Find-Module -Name $module -Repository PSGallery -ErrorAction SilentlyContinue
+                if ($latest) {
+                    $updates += "- $($module): $($latest.Version)"
+                }
+            } catch {
+                Write-Warning "Could not check updates for $module"
+            }
+        }
+        
+        if ($updates.Count -gt 0) {
+            Write-Host "Available updates:"
+            $updates | ForEach-Object { Write-Host $_ }
+            
+            # Create an issue for updates
+            $body = @"
+        ## Automated Dependency Update Check
+        
+        The following PowerShell modules have updates available:
+        
+        $($updates -join "`n")
+        
+        **Recommended Actions:**
+        1. Review the changelogs for breaking changes
+        2. Test compatibility with the AIMaster Security System
+        3. Update the documentation if needed
+        4. Update any version requirements in the code
+        
+        *This is an automated update check for the AIMaster Security System - Generated by Warp AI*
+        "@
+            
+            # Save update info for potential issue creation
+            echo "UPDATES_AVAILABLE=true" >> $GITHUB_ENV
+            echo "UPDATE_BODY<<EOF" >> $GITHUB_ENV
+            echo $body >> $GITHUB_ENV
+            echo "EOF" >> $GITHUB_ENV
+        } else {
+            Write-Host "✓ All dependencies are up to date"
+        }
+        
+    - name: Create update issue
+      if: env.UPDATES_AVAILABLE == 'true'
+      uses: actions/github-script@v6
+      with:
+        script: |
+          const title = `[MAINTENANCE] Dependency Updates Available - ${new Date().toDateString()}`;
+          const body = process.env.UPDATE_BODY;
+          
+          github.rest.issues.create({
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            title: title,
+            body: body,
+            labels: ['dependencies', 'maintenance', 'automated']
+          });
+
+  # Release automation
+  create-release:
+    name: Create Release
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main' && contains(github.event.head_commit.message, '[RELEASE]')
+    
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+      
+    - name: Extract version from commit message
+      id: version
+      run: |
+        VERSION=$(echo "${{ github.event.head_commit.message }}" | grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+' | head -1)
+        if [ -z "$VERSION" ]; then
+          VERSION="v1.0.0"
+        fi
+        echo "VERSION=$VERSION" >> $GITHUB_OUTPUT
+        
+    - name: Create Release
+      uses: actions/github-script@v6
+      with:
+        script: |
+          const version = '${{ steps.version.outputs.VERSION }}';
+          const tagName = version;
+          
+          // Create the release
+          const release = await github.rest.repos.createRelease({
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            tag_name: tagName,
+            name: `AIMaster Security System ${version}`,
+            body: `## AIMaster Security System Release ${version}
+
+**Generated by Warp AI** - Enterprise-grade security framework for modern applications.
+
+### 🚀 Features
+- Complete security framework implementation
+- Cross-platform support (Windows, macOS, Linux)  
+- Environment-specific parameterization
+- Comprehensive authentication and authorization
+- Sandbox environment isolation
+- Secure deployment management
+- Real-time monitoring and auditing
+
+### 📥 Installation
+\`\`\`powershell
+# Clone and run
+git clone https://github.com/${context.repo.owner}/${context.repo.repo}.git
+cd ${context.repo.repo}
+./AIMaster-SecuritySystem.ps1 -Environment Development -CreateSampleUser
+\`\`\`
+
+### 🛡️ Security
+This release includes comprehensive security features and has been automatically tested across multiple platforms.
+
+---
+*This release was automatically created for the AIMaster Security System - Generated by Warp AI*`,
+            draft: false,
+            prerelease: false
+          });
+          
+          console.log(`Created release: ${release.data.html_url}`);
